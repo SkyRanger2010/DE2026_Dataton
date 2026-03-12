@@ -79,8 +79,7 @@ docker compose up -d
 ## Документация
 
 - **Отчёт по кейсу и критерии выполнения:** [docs/CASE_REPORT.md](docs/CASE_REPORT.md)
-- **Слайды защиты:** [PRESENTATION_SLIDES.md](PRESENTATION_SLIDES.md)
-- **Superset (подключение, дашборд MVP):** [docs/SUPERSET_MVP.md](docs/SUPERSET_MVP.md)
+
 
 ---
 
