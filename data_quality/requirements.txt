@@ -1,0 +1,3 @@
+psycopg2-binary>=2.9
+pyspark>=3.4
+# для raw_to_ods.py (Spark + JDBC)

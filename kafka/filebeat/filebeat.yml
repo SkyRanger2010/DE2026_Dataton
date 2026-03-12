@@ -1,0 +1,27 @@
+# Filebeat (датаинженер Kafka): отправка файловых логов/CSV в Kafka.
+# В основном стеке поднимается с профилем: docker compose --profile filebeat up -d
+# По умолчанию читает /logs/*.csv (в compose смонтирован sample_data как /logs).
+
+filebeat.inputs:
+  - type: filestream
+    id: csv-logs
+    enabled: true
+    paths:
+      - /logs/*.csv
+    fields:
+      log_type: csv
+    fields_under_root: false
+
+output.kafka:
+  hosts: ["kafka:9092"]
+  topic: "filebeat-logs"
+  required_acks: 1
+  compression: gzip
+  max_message_bytes: 1000000
+
+processors:
+  - add_host_metadata:
+      when.not.contains.tags: forwarded
+
+logging.level: info
+logging.to_files: false

@@ -1,0 +1,28 @@
+{
+  "name": "debezium-postgres-ods",
+  "config": {
+    "connector.class": "io.debezium.connector.postgresql.PostgresConnector",
+    "tasks.max": "1",
+    "database.hostname": "postgres",
+    "database.port": "5432",
+    "database.user": "airflow",
+    "database.password": "airflow",
+    "database.dbname": "airflow",
+    "database.server.name": "postgres-dataton",
+    "schema.include.list": "ods",
+    "table.include.list": "ods.fct_actions",
+    "plugin.name": "pgoutput",
+    "topic.prefix": "cdc",
+    "key.converter": "org.apache.kafka.connect.storage.StringConverter",
+    "value.converter": "org.apache.kafka.connect.json.JsonConverter",
+    "value.converter.schemas.enable": "false",
+    "transforms": "unwrap,route",
+    "transforms.unwrap.type": "io.debezium.transforms.ExtractNewRecordState",
+    "transforms.unwrap.drop.tombstones": "false",
+    "transforms.unwrap.delete.handling.mode": "drop",
+    "transforms.route.type": "io.debezium.transforms.ByLogicalTableRouter",
+    "transforms.route.topic.regex": "cdc.ods.fct_actions",
+    "transforms.route.topic.replacement": "raw_actions",
+    "poll.interval.ms": "5000"
+  }
+}

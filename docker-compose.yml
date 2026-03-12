@@ -1,0 +1,464 @@
+# Стек данных: кейс Билайн (DE2026_Dataton)
+# Основа — telecom-mart: Postgres (airflow + meta), MinIO, Hive Metastore, Trino, Airflow, Superset
+
+services:
+  # --- БД Airflow + Superset ---
+  postgres-airflow:
+    image: postgres:16
+    container_name: postgres-airflow
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+    environment:
+      POSTGRES_USER: ${PG_AIRFLOW_USER:-airflow}
+      POSTGRES_PASSWORD: ${PG_AIRFLOW_PASSWORD:-airflow}
+      POSTGRES_DB: ${PG_AIRFLOW_DB:-airflow}
+    ports:
+      - "${PG_AIRFLOW_PORT:-5432}:5432"
+    volumes:
+      - pg_airflow_data:/var/lib/postgresql/data
+      - ./docker/init/postgres-airflow:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${PG_AIRFLOW_USER:-airflow} -d ${PG_AIRFLOW_DB:-airflow}"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    networks:
+      - dataton
+
+  # --- БД Hive Metastore ---
+  postgres-meta:
+    image: postgres:16
+    container_name: postgres-meta
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+    environment:
+      POSTGRES_USER: ${PG_META_USER:-postgres}
+      POSTGRES_PASSWORD: ${PG_META_PASSWORD:-postgres}
+      POSTGRES_DB: postgres
+    ports:
+      - "${PG_META_PORT:-5433}:5432"
+    volumes:
+      - pg_meta_data:/var/lib/postgresql/data
+      - ./docker/init/postgres-meta:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${PG_META_USER:-postgres} -d postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    networks:
+      - dataton
+
+  # --- S3-совместимое хранилище (Iceberg) ---
+  minio:
+    image: minio/minio:latest
+    container_name: minio
+    restart: unless-stopped
+    command: server /data --console-address :9001
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+    volumes:
+      - minio_data:/data
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    healthcheck:
+      test: ["CMD-SHELL", "exit 0"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - dataton
+
+  minio-init:
+    image: minio/mc:latest
+    container_name: minio-init
+    depends_on:
+      - minio
+    entrypoint: >
+      /bin/sh -c "
+      until mc alias set myminio http://minio:9000 $${MINIO_ROOT_USER:-minioadmin} $${MINIO_ROOT_PASSWORD:-minioadmin}; do echo wait minio; sleep 2; done;
+      mc mb myminio/warehouse --ignore-existing;
+      "
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+    networks:
+      - dataton
+
+  # --- Kafka (Confluent Platform) ---
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    container_name: zookeeper
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    volumes:
+      - zookeeper_data:/var/lib/zookeeper/data
+    ports:
+      - "2181:2181"
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "2181"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks:
+      - dataton
+
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: kafka
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,PLAINTEXT_HOST://0.0.0.0:29092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://host.docker.internal:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - kafka_data:/var/lib/kafka/data
+    ports:
+      - "${KAFKA_PORT:-9092}:9092"
+      - "29092:29092"
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-broker-api-versions --bootstrap-server localhost:9092 2>/dev/null || exit 1"]
+      interval: 10s
+      timeout: 15s
+      retries: 8
+      start_period: 45s
+    networks:
+      - dataton
+
+  kafka-connect:
+    image: quay.io/debezium/connect:2.7
+    container_name: kafka-connect
+    restart: unless-stopped
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      BOOTSTRAP_SERVERS: kafka:9092
+      GROUP_ID: connect-cluster
+      CONFIG_STORAGE_TOPIC: connect-configs
+      OFFSET_STORAGE_TOPIC: connect-offsets
+      STATUS_STORAGE_TOPIC: connect-status
+      KEY_CONVERTER: org.apache.kafka.connect.storage.StringConverter
+      VALUE_CONVERTER: org.apache.kafka.connect.json.JsonConverter
+      VALUE_CONVERTER_SCHEMAS_ENABLE: "false"
+      CONNECT_PLUGIN_PATH: "/usr/share/java,/kafka/connect-plugins"
+    volumes:
+      - ./kafka/connect-plugins:/kafka/connect-plugins:ro
+    ports:
+      - "${KAFKA_CONNECT_PORT:-8083}:8083"
+    networks:
+      - dataton
+
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: kafka-ui
+    restart: unless-stopped
+    depends_on:
+      - kafka
+    environment:
+      KAFKA_CLUSTERS_0_NAME: dataton
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+      KAFKA_CLUSTERS_0_ZOOKEEPER: zookeeper:2181
+    ports:
+      - "${KAFKA_UI_PORT:-8090}:8080"
+    networks:
+      - dataton
+
+  # --- Hive Metastore (каталог Iceberg) ---
+  hive-metastore:
+    build:
+      context: ./docker/hive
+      dockerfile: Dockerfile
+    image: dataton-hive-metastore:latest
+    container_name: hive-metastore
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+    depends_on:
+      postgres-meta:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+    environment:
+      SERVICE_NAME: metastore
+      DB_DRIVER: postgres
+      HADOOP_CONF_DIR: /opt/hadoop/etc/hadoop
+      HADOOP_OPTIONAL_TOOLS: hadoop-aws
+      SERVICE_OPTS: >
+        -Djavax.jdo.option.ConnectionURL=jdbc:postgresql://postgres-meta:5432/hivemeta
+        -Djavax.jdo.option.ConnectionDriverName=org.postgresql.Driver
+        -Djavax.jdo.option.ConnectionUserName=${PG_META_USER:-postgres}
+        -Djavax.jdo.option.ConnectionPassword=${PG_META_PASSWORD:-postgres}
+        -Dmetastore.try.direct.sql.ddl=false
+        -Dhive.metastore.warehouse.dir=s3a://warehouse/
+        -Dhive.metastore.schema.verification=false
+        -Dhive.metastore.event.db.notification.api.auth=false
+    volumes:
+      - ./docker/hive/core-site.xml:/opt/hadoop/etc/hadoop/core-site.xml:ro
+    ports:
+      - "9083:9083"
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c '</dev/tcp/localhost/9083'"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 60s
+    networks:
+      - dataton
+
+  # --- Trino (SQL к Iceberg) ---
+  trino:
+    image: trinodb/trino:434
+    container_name: trino
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+    depends_on:
+      hive-metastore:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+    ports:
+      - "${TRINO_PORT:-8082}:8080"
+    volumes:
+      - ./docker/trino:/etc/trino:ro
+    networks:
+      - dataton
+
+  # --- Spark (ETL: Kafka/Iceberg, витрины) ---
+  spark-master:
+    image: apache/spark:3.5.0
+    container_name: spark-master
+    hostname: spark-master
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+    command: /opt/spark/bin/spark-class org.apache.spark.deploy.master.Master
+    environment:
+      CSV_BASE_PATH: /sample_data
+    volumes:
+      - ./docker/spark/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf:ro
+      - ./spark:/opt/spark/app:ro
+      - ./sample_data:/sample_data:ro
+      - spark_ivy_cache:/home/spark/.ivy2
+    ports:
+      - "${SPARK_UI_PORT:-8081}:8080"
+      - "7077:7077"
+    depends_on:
+      hive-metastore:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+    networks:
+      - dataton
+
+  spark-worker:
+    image: apache/spark:3.5.0
+    container_name: spark-worker
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+    command: /opt/spark/bin/spark-class org.apache.spark.deploy.worker.Worker spark://spark-master:7077
+    environment:
+      SPARK_WORKER_CORES: 2
+      SPARK_WORKER_MEMORY: 2G
+      CSV_BASE_PATH: /sample_data
+    volumes:
+      - ./docker/spark/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf:ro
+      - ./spark:/opt/spark/app:ro
+      - ./sample_data:/sample_data:ro
+    depends_on:
+      - spark-master
+    networks:
+      - dataton
+
+  # --- Airflow ---
+  airflow-init:
+    image: apache/airflow:2.10.3-python3.11
+    container_name: airflow-init
+    restart: "no"
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+    depends_on:
+      postgres-airflow:
+        condition: service_healthy
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${PG_AIRFLOW_USER:-airflow}:${PG_AIRFLOW_PASSWORD:-airflow}@postgres-airflow:5432/${PG_AIRFLOW_DB:-airflow}
+      AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW__CORE__FERNET_KEY:-dGVzdF9rZXlfZm9yX2Rldl9haXJmbG93MTIzNDU2Nzg=}
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      AIRFLOW_UID: ${AIRFLOW_UID:-50000}
+    user: "${AIRFLOW_UID:-50000}:0"
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+      - airflow_logs:/opt/airflow/logs
+    command: >
+      bash -c "airflow db init &&
+        airflow users create --role Admin --username admin --email admin@local --firstname Admin --lastname User --password admin || true"
+    networks:
+      - dataton
+
+  airflow-webserver:
+    image: apache/airflow:2.10.3-python3.11
+    container_name: airflow-webserver
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+    depends_on:
+      postgres-airflow:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${PG_AIRFLOW_USER:-airflow}:${PG_AIRFLOW_PASSWORD:-airflow}@postgres-airflow:5432/${PG_AIRFLOW_DB:-airflow}
+      AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW__CORE__FERNET_KEY:-dGVzdF9rZXlfZm9yX2Rldl9haXJmbG93MTIzNDU2Nzg=}
+      AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      AIRFLOW__WEBSERVER__EXPOSE_CONFIG: "false"
+      AIRFLOW_UID: ${AIRFLOW_UID:-50000}
+      AIRFLOW_CONN_TRINO_DEFAULT: "trino://trino@trino:8080/iceberg"
+      _PIP_ADDITIONAL_REQUIREMENTS: "docker"
+    user: "${AIRFLOW_UID:-50000}:0"
+    ports:
+      - "${AIRFLOW_PORT:-8080}:8080"
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+      - airflow_logs:/opt/airflow/logs
+      - /var/run/docker.sock:/var/run/docker.sock
+    command: webserver
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+    networks:
+      - dataton
+
+  airflow-scheduler:
+    image: apache/airflow:2.10.3-python3.11
+    container_name: airflow-scheduler
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 1536M
+    depends_on:
+      postgres-airflow:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+      airflow-webserver:
+        condition: service_healthy
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${PG_AIRFLOW_USER:-airflow}:${PG_AIRFLOW_PASSWORD:-airflow}@postgres-airflow:5432/${PG_AIRFLOW_DB:-airflow}
+      AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW__CORE__FERNET_KEY:-dGVzdF9rZXlfZm9yX2Rldl9haXJmbG93MTIzNDU2Nzg=}
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      AIRFLOW_UID: ${AIRFLOW_UID:-50000}
+      AIRFLOW_CONN_TRINO_DEFAULT: "trino://trino@trino:8080/iceberg"
+      _PIP_ADDITIONAL_REQUIREMENTS: "docker"
+    user: "${AIRFLOW_UID:-50000}:0"
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+      - airflow_logs:/opt/airflow/logs
+      - /var/run/docker.sock:/var/run/docker.sock
+    command: scheduler
+    networks:
+      - dataton
+
+  # --- Redis (для Superset) ---
+  redis:
+    image: redis:7-alpine
+    container_name: redis
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks:
+      - dataton
+
+  # --- Superset (BI) ---
+  superset:
+    image: apache/superset:3.0.0
+    container_name: superset
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+    depends_on:
+      postgres-airflow:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      SUPERSET_SECRET_KEY: ${SUPERSET_SECRET_KEY:-change-me-in-production}
+      SUPERSET_LOAD_EXAMPLES: "no"
+      SUPERSET_ENV: development
+      SQLALCHEMY_DATABASE_URI: postgresql+psycopg2://${PG_AIRFLOW_USER:-airflow}:${PG_AIRFLOW_PASSWORD:-airflow}@postgres-airflow:5432/superset
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+    volumes:
+      - superset_home:/app/superset_home
+    ports:
+      - "${SUPERSET_PORT:-8088}:8088"
+    command: ["/usr/bin/run-server.sh"]
+    networks:
+      - dataton
+
+volumes:
+  pg_airflow_data:
+  pg_meta_data:
+  minio_data:
+  zookeeper_data:
+  kafka_data:
+  spark_ivy_cache:
+  airflow_logs:
+  superset_home:
+
+networks:
+  dataton:
+    driver: bridge
