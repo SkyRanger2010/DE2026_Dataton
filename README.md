@@ -1,8 +1,8 @@
 # DE2026_Dataton
 
-Платформа данных для телеком-компании (кейс **Билайн**): единое хранилище, ETL-пайплайны, BI и ML. Поток данных: **источники → Kafka → Spark → Iceberg (MinIO) → Trino / Superset**.
+Хакатон, кейс Билайна. Задача: построить платформу данных для телеком-компании — от приёма событий до дашбордов и ML-модели.
 
----
+Поток данных: **источники → Kafka → Spark → Iceberg (MinIO) → Trino → Superset**. Плюс XGBoost для прогноза клика по баннеру. Всё в Docker, одна команда на запуск.
 
 ## Быстрый старт
 
@@ -11,82 +11,80 @@ cp .env.example .env
 docker compose up -d
 ```
 
-После запуска создать топики Kafka (из корня репо):
+После старта нужно создать топики Kafka:
 
 ```bash
 ./kafka/create_topic.sh
-# или на Windows: .\kafka\create_topic.ps1
+# Windows: .\kafka\create_topic.ps1
 ```
 
-**Сервисы и порты** (по умолчанию, порты задаются в `.env`):
+Доступные сервисы (порты из `.env`, тут значения по умолчанию):
 
-| Сервис | URL | Назначение |
-|--------|-----|------------|
-| **Airflow** | http://localhost:8080 | Оркестрация пайплайнов (логин `admin` / пароль `admin`) |
-| **Trino** | http://localhost:8082 | SQL к Iceberg (каталог `iceberg`) |
-| **Superset** | http://localhost:8088 | BI-дашборды |
-| **MinIO Console** | http://localhost:9001 | S3-хранилище (логин/пароль из `.env`) |
-| **Spark UI** | http://localhost:8081 | Мониторинг Spark-задач |
-| **Kafka UI** | http://localhost:8090 | Топики и сообщения Kafka |
+- **Airflow** — `http://localhost:8080` (admin / admin)
+- **Trino** — `http://localhost:8082` (каталог `iceberg`)
+- **Superset** — `http://localhost:8088`
+- **MinIO** — `http://localhost:9001` (логин/пароль в `.env`)
+- **Spark UI** — `http://localhost:8081`
+- **Kafka UI** — `http://localhost:8090`
 
-Подробнее по запуску и настройке: [docker/README.md](docker/README.md).
+Подробнее по настройке: [`docker/README.md`](docker/README.md).
 
----
+## Как устроено
 
-## Архитектура
+Данные могут приходить двумя путями: CSV-файлы из `sample_data/` (готовые датасеты от организаторов) или симуляция событий через Kafka-продюсер. Дальше:
 
-- **Источники (MVP):** CSV ([sample_data/](sample_data/)) и/или симуляция событий в Kafka.
-- **Поток:** Kafka → Spark (ETL) → Iceberg в MinIO; каталог таблиц — Hive Metastore.
-- **Слои данных:** raw → ods → dm (витрины BI), ml (признаки и предсказания).
-- **Потребление:** Trino (SQL), Superset (дашборды), ML-модель (прогноз клика, рекомендация ставки).
+```
+CSV / Kafka events
+    ↓ Spark (PySpark)
+RAW — сырые данные в Iceberg
+    ↓ Spark
+ODS — очищенные, типизированные таблицы
+    ↓ Spark
+DM — витрины для BI (campaign_daily: показы, клики, CPM, CPC)
+    ↓ Spark
+ML — признаки и предсказания (user_features, прогноз клика)
+    ↓
+Trino (SQL) ← читает всё из Iceberg
+Superset ← дашборды через Trino
+```
 
-Оркестрация: **Airflow** (DAG-и с зависимостями и retry, запуск Spark через Docker).
+Оркестрация — Airflow. Три DAG'а:
 
-Подробно: [docs/CASE_REPORT.md](docs/CASE_REPORT.md), раздел «Реализованное решение».
-
----
-
-## Пайплайны (Airflow DAG-и)
-
-| DAG | Назначение |
+| DAG | Что делает |
 |-----|------------|
-| **banner_events_pipeline** | Kafka (топик `banner_events`) → raw → ods → dm.campaign_daily |
-| **csv_pipeline** | CSV (sample_data) → raw → ODS → dm.campaign_daily (полные метрики, CPM/CPC) |
-| **ml_daily_pipeline** | Сбор витрины признаков ml.user_features для модели прогноза клика |
+| `banner_events_pipeline` | Читает Kafka-топик `banner_events` → raw → ods → dm.campaign_daily |
+| `csv_pipeline` | Грузит CSV из sample_data → raw → ods → dm.campaign_daily (полные метрики, CPM/CPC) |
+| `ml_daily_pipeline` | Собирает витрину `ml.user_features`, гоняет модель |
 
-Топики создаются скриптом [kafka/create_topic.sh](kafka/create_topic.sh) (или [kafka/create_topic.ps1](kafka/create_topic.ps1)): `banner_events`, `installs`, `actions`, `raw_actions`, `control-iceberg`, `filebeat-logs`.
+Топики Kafka: `banner_events`, `installs`, `actions`, `raw_actions`, `control-iceberg`, `filebeat-logs`. Создаются скриптом из `kafka/`.
 
----
+## Что внутри
 
-## Структура репозитория
+Проект разбит по компонентам, у каждого свой README:
 
-| Каталог | Назначение |
-|---------|------------|
-| **airflow/** | DAG-и, конфигурация, запуск Spark-задач; [airflow/dags/README.md](airflow/dags/README.md), [airflow/operations.md](airflow/operations.md) |
-| **kafka/** | Топики, конфиги Connect/Debezium, продюсер симуляции; [kafka/README.md](kafka/README.md) |
-| **spark/** | ETL-скрипты (raw→ods, витрины, ML-признаки); [spark/README.md](spark/README.md), [spark/scripts/README.md](spark/scripts/README.md) |
-| **iceberg/** | Схемы таблиц (raw, ods, dm, ml), DDL, партиционирование; [iceberg/README.md](iceberg/README.md) |
-| **ml/** | Обучение (XGBoost) и инференс модели прогноза клика; [ml/README.md](ml/README.md) |
-| **docker/** | Конфиги контейнеров (Hive, Trino, Spark, init Postgres); [docker/README.md](docker/README.md) |
-| **docs/** | Архитектура, отчёт по кейсу, описание слайдов защиты; эталонная логика витрины — [docs/sql/dm_campaign_daily.sql](docs/sql/dm_campaign_daily.sql) |
-| **docs/sql/trino/** | SQL для загрузки в Trino (демо dm, ml); [docs/sql/trino/README.md](docs/sql/trino/README.md) |
-| **bi/** | BI: датасеты, дашборды Superset, подключение к Trino; [bi/README.md](bi/README.md), [docs/SUPERSET_MVP.md](docs/SUPERSET_MVP.md) |
-| **sample_data/** | Исходные CSV для загрузки в raw; [sample_data/DESCRIPTION.md](sample_data/DESCRIPTION.md) |
-| **data_quality/** | Скрипты загрузки CSV→raw и raw→ods (качество данных); [data_quality/README.md](data_quality/README.md) |
-
----
+- **airflow/** — DAG'и, конфиги, запуск Spark-задач
+- **kafka/** — топики, конфиги Connect/Debezium, продюсер-симулятор
+- **spark/** — скрипты ETL (raw→ods, витрины, ML-признаки)
+- **iceberg/** — DDL-схемы таблиц (raw, ods, dm, ml), партиционирование
+- **ml/** — обучение XGBoost и инференс модели
+- **docker/** — конфиги контейнеров (Hive, Trino, Spark, инит Postgres)
+- **bi/** — датасеты Superset, подключение к Trino
+- **docs/** — архитектура, отчёт по кейсу, SQL эталонной витрины, слайды защиты
+- **sample_data/** — исходные CSV для загрузки
+- **data_quality/** — скрипты проверки качества при загрузке CSV→raw и raw→ods
 
 ## Документация
 
-- **Отчёт по кейсу и критерии выполнения:** [docs/CASE_REPORT.md](docs/CASE_REPORT.md)
+Основной отчёт по хакатону: [`docs/CASE_REPORT.md`](docs/CASE_REPORT.md).
 
+SQL витрины: [`docs/sql/dm_campaign_daily.sql`](docs/sql/dm_campaign_daily.sql). Загрузка в Trino: [`docs/sql/trino/README.md`](docs/sql/trino/README.md).
 
----
+Дашборды Superset: [`docs/SUPERSET_MVP.md`](docs/SUPERSET_MVP.md), [`bi/README.md`](bi/README.md).
 
 ## Остановка
 
 ```bash
 docker compose down
-# с удалением данных (БД, MinIO, Kafka и т.д.):
+# с удалением данных (БД, MinIO, Kafka):
 docker compose down -v
 ```
